@@ -1,47 +1,37 @@
 #!/usr/bin/env python3
-"""Monitor sports odds and send Telegram alerts.
+"""Monitor bet365 pre-match soccer odds across every available league.
 
-The default adapter is compatible with The Odds API v4. Configure it with
-environment variables, for example:
+The first successful poll after process startup silently replaces the local
+baseline and never sends alerts. Later polls send Telegram alerts for odds
+drops greater than the configured threshold or explicit market locks.
 
-    export ODDS_API_KEY="your-odds-api-key"
-    export TELEGRAM_BOT_TOKEN="your-bot-token"
-    export TELEGRAM_CHAT_ID="your-chat-id"
-    export ODDS_SPORT="soccer_epl"
-    python main.py
-
-The script stores the previous poll in ``ODDS_STATE_FILE`` (default:
-``odds_state.json``). The first poll establishes a baseline and does not
-generate drop alerts.
-
-The Odds API normally returns prices but not market lock status. Lock alerts
-are emitted when an odds provider includes an explicit status such as
-``suspended``, ``locked``, or ``closed`` in a market/bookmaker/event object.
-This keeps the lock detection useful with APIs that expose those fields while
-avoiding false positives when a market is simply absent from a response.
+The script discovers active soccer leagues from The Odds API, requests only
+standard ``h2h`` back odds, and ignores every bookmaker except bet365.
 """
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import logging
 import os
 import sys
 import tempfile
-from threading import Thread
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-from flask import Flask, jsonify
 import requests
 
 
 LOGGER = logging.getLogger("odds-monitor")
+DEFAULT_SPORTS_URL = "https://api.the-odds-api.com/v4/sports"
 DEFAULT_ODDS_URL = "https://api.the-odds-api.com/v4/sports/{sport}/odds/"
 DEFAULT_TELEGRAM_URL = "https://api.telegram.org"
+TARGET_BOOKMAKER = "bet365"
+STANDARD_MARKET = "h2h"
 LOCKED_STATUSES = {
     "closed",
     "halted",
@@ -51,28 +41,16 @@ LOCKED_STATUSES = {
     "suspended",
     "unavailable",
 }
-HEALTH_PORT = 8080
-health_app = Flask("odds-monitor-health")
-
-
-@health_app.get("/health")
-def health() -> tuple[Any, int]:
-    return jsonify({"status": "ok", "service": "odds-monitor"}), 200
-
-
-def start_health_server() -> Thread:
-    server_thread = Thread(
-        target=lambda: health_app.run(
-            host="0.0.0.0",
-            port=HEALTH_PORT,
-            threaded=True,
-            use_reloader=False,
-        ),
-        name="health-server",
-        daemon=True,
-    )
-    server_thread.start()
-    return server_thread
+PREMATCH_EXCLUDED_STATUSES = {
+    "cancelled",
+    "canceled",
+    "completed",
+    "finished",
+    "inplay",
+    "live",
+    "postponed",
+    "started",
+}
 
 
 class ConfigurationError(ValueError):
@@ -84,11 +62,9 @@ class Config:
     odds_api_key: str
     telegram_bot_token: str
     telegram_chat_id: str
+    sports_url: str
     odds_url: str
-    sport: str
     regions: str
-    markets: str
-    odds_format: str
     poll_interval: int
     drop_threshold: float
     state_file: Path
@@ -120,20 +96,13 @@ class Config:
         if request_timeout < 1:
             raise ConfigurationError("REQUEST_TIMEOUT_SECONDS must be at least 1")
 
-        odds_url = os.getenv("ODDS_API_URL", DEFAULT_ODDS_URL)
-        sport = os.getenv("ODDS_SPORT", "soccer_epl")
-        if "{sport}" in odds_url:
-            odds_url = odds_url.format(sport=sport)
-
         return cls(
             odds_api_key=os.environ["ODDS_API_KEY"],
             telegram_bot_token=os.environ["TELEGRAM_BOT_TOKEN"],
             telegram_chat_id=os.environ["TELEGRAM_CHAT_ID"],
-            odds_url=odds_url,
-            sport=sport,
+            sports_url=os.getenv("ODDS_SPORTS_URL", DEFAULT_SPORTS_URL),
+            odds_url=os.getenv("ODDS_API_URL", DEFAULT_ODDS_URL),
             regions=os.getenv("ODDS_REGIONS", "eu"),
-            markets=os.getenv("ODDS_MARKETS", "h2h"),
-            odds_format=os.getenv("ODDS_FORMAT", "decimal"),
             poll_interval=poll_interval,
             drop_threshold=drop_threshold,
             state_file=Path(os.getenv("ODDS_STATE_FILE", "odds_state.json")),
@@ -142,8 +111,6 @@ class Config:
 
 
 def _text(value: Any, default: str = "Unknown") -> str:
-    """Return a readable string for optional API fields."""
-
     if value is None or value == "":
         return default
     return str(value)
@@ -157,41 +124,93 @@ def _number(value: Any) -> float | None:
     return number if number > 0 else None
 
 
+def _normalise(value: Any) -> str:
+    return "".join(character.lower() for character in _text(value, "") if character.isalnum())
+
+
 def _normalise_status(value: Any) -> str:
     return _text(value, "").strip().lower().replace("-", "_").replace(" ", "_")
 
 
-def _object_is_locked(*objects: dict[str, Any] | None) -> bool:
-    """Inspect common explicit lock/status fields without guessing on absence."""
+def _request_error_summary(error: requests.RequestException) -> str:
+    response = getattr(error, "response", None)
+    if response is not None:
+        return f"HTTP {response.status_code}"
+    return type(error).__name__
 
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _is_prematch(event: dict[str, Any], now: datetime) -> bool:
+    status = _normalise_status(
+        event.get("status") or event.get("event_status") or event.get("state")
+    )
+    if status in PREMATCH_EXCLUDED_STATUSES:
+        return False
+
+    commence_time = _parse_datetime(
+        event.get("commence_time")
+        or event.get("start_time")
+        or event.get("startTime")
+    )
+    if commence_time is None:
+        return False
+    return commence_time.astimezone(timezone.utc) > now
+
+
+def _object_is_locked(*objects: dict[str, Any] | None) -> bool:
     status_keys = ("status", "market_status", "state")
     boolean_keys = ("locked", "is_locked", "suspended", "is_suspended")
 
     for obj in objects:
         if not isinstance(obj, dict):
             continue
-        for key in status_keys:
-            if _normalise_status(obj.get(key)) in LOCKED_STATUSES:
-                return True
-        for key in boolean_keys:
-            if obj.get(key) is True:
-                return True
+        if any(
+            _normalise_status(obj.get(key)) in LOCKED_STATUSES for key in status_keys
+        ):
+            return True
+        if any(obj.get(key) is True for key in boolean_keys):
+            return True
         if obj.get("active") is False:
             return True
     return False
 
 
-def _iter_offers(events: Any) -> Iterable[dict[str, Any]]:
-    """Flatten a The Odds API response into comparable offer records."""
+def _is_soccer_sport(sport: dict[str, Any]) -> bool:
+    key = _text(sport.get("key"), "").lower()
+    return (key == "soccer" or key.startswith("soccer_")) and (
+        sport.get("active") is not False
+    )
 
+
+def _iter_offers(
+    events: Any,
+    sport_key: str,
+    sport_title: str,
+    now: datetime,
+) -> Iterable[dict[str, Any]]:
     if isinstance(events, dict):
         events = events.get("events", [])
     if not isinstance(events, list):
         raise ValueError("Odds API response must be a list of events")
 
     for event in events:
-        if not isinstance(event, dict):
+        if not isinstance(event, dict) or not _is_prematch(event, now):
             continue
+
         event_id = _text(event.get("id"), _text(event.get("event_id")))
         event_name = _text(
             event.get("name"),
@@ -200,31 +219,39 @@ def _iter_offers(events: Any) -> Iterable[dict[str, Any]]:
         bookmakers = event.get("bookmakers", [])
         if not isinstance(bookmakers, list):
             continue
+
         for bookmaker in bookmakers:
             if not isinstance(bookmaker, dict):
                 continue
-            bookmaker_id = _text(
-                bookmaker.get("key"), _text(bookmaker.get("id"), _text(bookmaker.get("title")))
-            )
-            bookmaker_name = _text(bookmaker.get("title"), bookmaker_id)
+            bookmaker_key = _normalise(bookmaker.get("key"))
+            bookmaker_title = _normalise(bookmaker.get("title"))
+            if bookmaker_key != TARGET_BOOKMAKER and bookmaker_title != TARGET_BOOKMAKER:
+                continue
+
+            bookmaker_name = _text(bookmaker.get("title"), TARGET_BOOKMAKER)
             markets = bookmaker.get("markets", [])
             if not isinstance(markets, list):
                 continue
+
             for market in markets:
                 if not isinstance(market, dict):
                     continue
-                market_id = _text(
-                    market.get("key"), _text(market.get("id"), _text(market.get("name")))
-                )
-                market_name = _text(market.get("name"), market_id)
+                market_key = _text(
+                    market.get("key"),
+                    _text(market.get("id"), _text(market.get("name"))),
+                ).lower()
+                if market_key != STANDARD_MARKET:
+                    continue
+
+                market_name = _text(market.get("name"), market_key)
                 locked = _object_is_locked(event, bookmaker, market)
                 outcomes = market.get("outcomes", [])
-
-                # A locked market may not have outcomes. Keep one record so the
-                # lock transition can still be compared and alerted.
                 if not isinstance(outcomes, list) or not outcomes:
                     yield {
-                        "key": "|".join((event_id, bookmaker_id, market_id, "__market__")),
+                        "key": "|".join(
+                            (sport_key, event_id, TARGET_BOOKMAKER, market_key, "__market__")
+                        ),
+                        "sport": sport_title,
                         "event": event_name,
                         "bookmaker": bookmaker_name,
                         "market": market_name,
@@ -242,11 +269,18 @@ def _iter_offers(events: Any) -> Iterable[dict[str, Any]]:
                         outcome.get("name"), _text(outcome.get("label"), "Outcome")
                     )
                     point = outcome.get("point")
-                    point_key = _text(point, "")
                     yield {
                         "key": "|".join(
-                            (event_id, bookmaker_id, market_id, outcome_name, point_key)
+                            (
+                                sport_key,
+                                event_id,
+                                TARGET_BOOKMAKER,
+                                market_key,
+                                outcome_name,
+                                _text(point, ""),
+                            )
                         ),
+                        "sport": sport_title,
                         "event": event_name,
                         "bookmaker": bookmaker_name,
                         "market": market_name,
@@ -261,24 +295,76 @@ class OddsMonitor:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.session = requests.Session()
+        self._baseline_loaded = False
+        self._last_fetch_complete = True
 
-    def fetch_offers(self) -> list[dict[str, Any]]:
+    def fetch_soccer_sports(self) -> list[dict[str, Any]]:
         response = self.session.get(
-            self.config.odds_url,
-            params={
-                "apiKey": self.config.odds_api_key,
-                "regions": self.config.regions,
-                "markets": self.config.markets,
-                "oddsFormat": self.config.odds_format,
-            },
+            self.config.sports_url,
+            params={"apiKey": self.config.odds_api_key},
             timeout=self.config.request_timeout,
         )
         response.raise_for_status()
         try:
             payload = response.json()
         except ValueError as exc:
-            raise ValueError("Odds API returned invalid JSON") from exc
-        return list(_iter_offers(payload))
+            raise ValueError("Sports endpoint returned invalid JSON") from exc
+        if not isinstance(payload, list):
+            raise ValueError("Sports endpoint response must be a list")
+        return [sport for sport in payload if isinstance(sport, dict) and _is_soccer_sport(sport)]
+
+    def fetch_offers(self) -> list[dict[str, Any]]:
+        try:
+            sports = self.fetch_soccer_sports()
+        except requests.RequestException as exc:
+            self._last_fetch_complete = False
+            LOGGER.error("Could not discover soccer leagues: %s", _request_error_summary(exc))
+            return []
+        except ValueError as exc:
+            self._last_fetch_complete = False
+            LOGGER.error("Could not parse soccer league list: %s", exc)
+            return []
+
+        now = datetime.now(timezone.utc)
+        offers: list[dict[str, Any]] = []
+        self._last_fetch_complete = True
+        LOGGER.info("Discovered %d active soccer leagues", len(sports))
+
+        for sport in sports:
+            sport_key = _text(sport.get("key"), "")
+            try:
+                odds_url = self.config.odds_url.format(sport=sport_key)
+                response = self.session.get(
+                    odds_url,
+                    params={
+                        "apiKey": self.config.odds_api_key,
+                        "regions": self.config.regions,
+                        "markets": STANDARD_MARKET,
+                        "oddsFormat": "decimal",
+                    },
+                    timeout=self.config.request_timeout,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                offers.extend(
+                    _iter_offers(
+                        payload,
+                        sport_key,
+                        _text(sport.get("title"), sport_key),
+                        now,
+                    )
+                )
+            except requests.RequestException as exc:
+                self._last_fetch_complete = False
+                LOGGER.warning(
+                    "Could not fetch %s odds: %s",
+                    sport_key,
+                    _request_error_summary(exc),
+                )
+            except ValueError as exc:
+                LOGGER.warning("Could not parse %s odds: %s", sport_key, exc)
+
+        return offers
 
     def send_telegram(self, message: str) -> None:
         url = (
@@ -304,26 +390,27 @@ class OddsMonitor:
 
     def run_once(self) -> int:
         offers = self.fetch_offers()
+        if not self._last_fetch_complete:
+            LOGGER.warning("Skipping alerts and state update because the odds poll was incomplete")
+            return 0
+
         previous = load_state(self.config.state_file)
-        current: dict[str, dict[str, Any]] = {}
-
-        is_baseline = not previous
+        is_baseline = not self._baseline_loaded
         if is_baseline:
-            LOGGER.info("Loaded %d offers; saved the initial baseline", len(offers))
-        alerts: list[str] = []
+            LOGGER.info("Loaded %d bet365 pre-match offers as the silent baseline", len(offers))
 
+        current: dict[str, dict[str, Any]] = {}
+        alerts: list[str] = []
         for offer in offers:
             key = offer["key"]
-            current[key] = {
-                "price": offer["price"],
-                "locked": offer["locked"],
-            }
+            current[key] = {"price": offer["price"], "locked": offer["locked"]}
             old = previous.get(key, {})
             old_price = _number(old.get("price"))
             new_price = offer["price"]
 
             if (
-                old_price is not None
+                not is_baseline
+                and old_price is not None
                 and new_price is not None
                 and new_price < old_price
             ):
@@ -339,6 +426,7 @@ class OddsMonitor:
                 alerts.append(format_lock_alert(offer))
 
         save_state(self.config.state_file, current)
+        self._baseline_loaded = True
 
         for alert in alerts:
             try:
@@ -349,7 +437,7 @@ class OddsMonitor:
             except (RuntimeError, ValueError):
                 LOGGER.exception("Telegram returned an unsuccessful response")
 
-        LOGGER.info("Checked %d offers; generated %d alert(s)", len(offers), len(alerts))
+        LOGGER.info("Checked %d eligible bet365 offers; generated %d alert(s)", len(offers), len(alerts))
         return len(alerts)
 
 
@@ -362,6 +450,7 @@ def format_drop_alert(
     point = f" ({offer['point']})" if offer.get("point") is not None else ""
     return (
         "ODDS DROP\n"
+        f"League: {offer['sport']}\n"
         f"Event: {offer['event']}\n"
         f"Bookmaker: {offer['bookmaker']}\n"
         f"Market: {offer['market']}\n"
@@ -374,6 +463,7 @@ def format_drop_alert(
 def format_lock_alert(offer: dict[str, Any]) -> str:
     return (
         "MARKET LOCKED\n"
+        f"League: {offer['sport']}\n"
         f"Event: {offer['event']}\n"
         f"Bookmaker: {offer['bookmaker']}\n"
         f"Market: {offer['market']}\n"
@@ -441,14 +531,11 @@ def main() -> int:
         LOGGER.error("%s", exc)
         return 2
 
-    start_health_server()
-    LOGGER.info("Health server listening on port %d", HEALTH_PORT)
-
     while True:
         try:
             monitor.run_once()
         except requests.RequestException as exc:
-            LOGGER.error("Odds API request failed: %s", exc)
+            LOGGER.error("Odds API request failed: %s", _request_error_summary(exc))
         except (ValueError, RuntimeError) as exc:
             LOGGER.error("Odds poll failed: %s", exc)
 
