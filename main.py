@@ -27,8 +27,8 @@ import requests
 
 
 LOGGER = logging.getLogger("odds-monitor")
-DEFAULT_SPORTS_URL = "https://api.the-odds-api.com/v4/sports"
-DEFAULT_ODDS_URL = "https://api.the-odds-api.com/v4/sports/{sport}/odds/"
+DEFAULT_SPORTS_URL = "https://football-odds-scraper.p.rapidapi.com/v1/sports"
+DEFAULT_ODDS_URL = "https://football-odds-scraper.p.rapidapi.com/v1/odds/{sport}"
 DEFAULT_TELEGRAM_URL = "https://api.telegram.org"
 TARGET_BOOKMAKER = "bet365"
 STANDARD_MARKET = "h2h"
