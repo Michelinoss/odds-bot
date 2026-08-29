@@ -4,11 +4,12 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 
 import requests
 
-from main import ConfigurationError, Config, OddsMonitor
+from main import ConfigurationError, Config, OddsMonitor, _request_error_summary
 
 
 LOGGER = logging.getLogger("odds-monitor-worker")
@@ -22,14 +23,18 @@ def run_forever() -> None:
         raise SystemExit(2) from exc
 
     monitor = OddsMonitor(config)
-    LOGGER.info("Background odds worker started; polling every %d seconds", config.poll_interval)
+    LOGGER.info(
+        "Background odds worker started; bet365 pre-match soccer polling every %d seconds",
+        config.poll_interval,
+    )
+    LOGGER.info("The first successful poll establishes a silent baseline")
 
     while True:
         poll_started = time.monotonic()
         try:
             monitor.run_once()
         except requests.RequestException as exc:
-            LOGGER.error("Odds API request failed: %s", exc)
+            LOGGER.error("Odds API request failed: %s", _request_error_summary(exc))
         except (ValueError, RuntimeError) as exc:
             LOGGER.error("Odds poll failed: %s", exc)
 
@@ -43,8 +48,9 @@ def run_forever() -> None:
 
 
 if __name__ == "__main__":
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
     logging.basicConfig(
-        level=getattr(logging, "INFO"),
+        level=getattr(logging, log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(message)s",
     )
     run_forever()
