@@ -36,19 +36,18 @@ def check_odds():
         print("Missing ODDS_API_KEY in Environment Variables!")
         return
         
-    print("Checking bet365 odds across all sports & markets...")
-    url = f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={ODDS_API_KEY}&regions=eu&bookmakers=bet365&markets=h2h,totals,spreads"
+    print("Checking bet365 odds...")
+    url = f"https://api.the-odds-api.com/v4/sports/soccer_epl/odds/?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h"
     
     try:
         res = requests.get(url, timeout=15)
         if res.status_code == 200:
             events = res.json()
-            print(f"Successfully fetched {len(events)} events from bet365.")
+            print(f"Successfully fetched {len(events)} events!")
         else:
-            print(f"API Error Status: {res.status_code}")
+            print(f"API Error Status: {res.status_code} - {res.text}")
     except Exception as e:
         print(f"Scan Exception: {e}")
-
 def bot_loop():
     time.sleep(5)
     send_telegram_alert("🟢 *bet365 Odds Bot Online!*")
