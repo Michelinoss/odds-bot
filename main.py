@@ -8,7 +8,6 @@ import requests
 
 app = Flask(__name__)
 
-# Endpoint για το UptimeRobot (διορθώνει τα 404)
 @app.route('/')
 @app.route('/health')
 def home():
@@ -38,7 +37,6 @@ def check_odds():
         return
         
     print("Checking bet365 odds across all sports & markets...")
-    # Λήψη αγώνων και αποδόσεων για bet365
     url = f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={ODDS_API_KEY}&regions=eu&bookmakers=bet365&markets=h2h,totals,spreads"
     
     try:
@@ -53,13 +51,13 @@ def check_odds():
 
 def bot_loop():
     time.sleep(5)
-    send_telegram_alert("🟢 *bet365 Odds Bot Online & Fixed!*\nΤο bot διορθώθηκε και παρακολουθεί πλέον κανονικά τη bet365.")
+    send_telegram_alert("🟢 *bet365 Odds Bot Online!*")
     while True:
         try:
             check_odds()
         except Exception as e:
             print(f"Loop error: {e}")
-        time.sleep(300)  # Έλεγχος κάθε 5 λεπτά
+        time.sleep(300)
 
 if __name__ == "__main__":
     threading.Thread(target=bot_loop, daemon=True).start()
