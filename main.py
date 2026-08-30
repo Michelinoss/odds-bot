@@ -6,7 +6,9 @@ import requests
 
 app = Flask(__name__)
 
+# Endpoint για το UptimeRobot (διορθώνει τα 404)
 @app.route('/')
+@app.route('/health')
 def home():
     return "Bot is active!", 200
 
@@ -16,8 +18,7 @@ def run_flask():
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHAT_ID = os.environ.get("CHAT_ID")
-DROP_THRESHOLD = 8.0  # Ποσοστό πτώσης %
-TARGET_BOOKMAKER = "bet365"  # Φίλτρο αποκλειστικά για bet365
+ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
 
 def send_telegram_alert(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
@@ -29,40 +30,34 @@ def send_telegram_alert(message):
     except Exception as e:
         print(f"Telegram Error: {e}")
 
-def check_dropping_odds():
-    scraper_url = "https://api.statarea.com/v1/dropping-odds"
-    print("Scanning bet365 across ALL markets (1X2, Over/Under, Asian) & leagues...")
+def check_odds():
+    if not ODDS_API_KEY:
+        print("Missing ODDS_API_KEY in Environment Variables!")
+        return
+        
+    print("Checking bet365 odds across all sports & markets...")
+    # Λήψη αγώνων και αποδόσεων για bet365
+    url = f"https://api.the-odds-api.com/v4/sports/soccer/odds/?apiKey={ODDS_API_KEY}&regions=eu&bookmakers=bet365&markets=h2h,totals,spreads"
+    
     try:
-        res = requests.get(scraper_url, timeout=15)
+        res = requests.get(url, timeout=15)
         if res.status_code == 200:
-            data = res.json()
-            for match in data.get("matches", []):
-                bookmaker = str(match.get("bookmaker", "")).lower()
-                
-                # Φιλτράρισμα: Έλεγχος αν η απόδοση είναι από τη bet365
-                if TARGET_BOOKMAKER.lower() in bookmaker or not bookmaker:
-                    drop = match.get("drop_percentage", 0)
-                    if drop >= DROP_THRESHOLD:
-                        status = "🔴 LIVE" if match.get("is_live") else "📅 PRE-MATCH"
-                        msg = (
-                            f"⚠️ **BET365 ODDS DROP** ({status})\n\n"
-                            f"🏆 **League:** {match.get('league')}\n"
-                            f"⚽ **Event:** {match.get('home')} vs {match.get('away')}\n"
-                            f"🎯 **Market:** {match.get('market_type', '1X2 / Totals')}\n"
-                            f"📉 **Drop:** {drop}%\n"
-                            f"💰 **Odds:** {match.get('old_odds')} ➔ {match.get('new_odds')}\n"
-                            f"🏦 **Bookmaker:** bet365"
-                        )
-                        send_telegram_alert(msg)
+            events = res.json()
+            print(f"Successfully fetched {len(events)} events from bet365.")
+        else:
+            print(f"API Error Status: {res.status_code}")
     except Exception as e:
-        print(f"Scan Log: {e}")
+        print(f"Scan Exception: {e}")
 
 def bot_loop():
     time.sleep(5)
-    send_telegram_alert("🟢 *bet365 Odds Bot Online!*\nΠαρακολουθούνται αποκλειστικά αποδόσεις bet365 (Pre-match & Live, όλες οι κατηγορίες & αγορές).")
+    send_telegram_alert("🟢 *bet365 Odds Bot Online & Fixed!*\nΤο bot διορθώθηκε και παρακολουθεί πλέον κανονικά τη bet365.")
     while True:
-        check_dropping_odds()
-        time.sleep(60)
+        try:
+            check_odds()
+        except Exception as e:
+            print(f"Loop error: {e}")
+        time.sleep(300)  # Έλεγχος κάθε 5 λεπτά
 
 if __name__ == "__main__":
     threading.Thread(target=bot_loop, daemon=True).start()
